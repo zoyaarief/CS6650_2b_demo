@@ -625,15 +625,34 @@ Destroy complete!
 
 ## Load Testing — Part IV
 
-Locust tests and screenshots will be added after completing the load-testing experiments.
+Locust used a 3:1 GET-to-POST task ratio because product reads are expected to be more common than product updates. The 50-user comparison used one local Locust process, a spawn rate of 10 users per second, a 60-second duration, and the same 1–2 second user wait time for both clients.
 
-Planned comparisons:
+| Test | Requests | Failures | Requests/s | Average | Median | p95 | p98 | Maximum |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| HttpUser, 50 users | 1,824 | 0 | 31.86 | 32.73 ms | 27 ms | 40 ms | 77 ms | 1,103 ms |
+| FastHttpUser, 50 users | 1,907 | 0 | 31.94 | 29.55 ms | 26 ms | 47 ms | 79 ms | 269 ms |
+| FastHttpUser, 200 users | 5,661 | 0 | 126.54 | 32 ms | 25 ms | 41 ms | 180 ms | 314 ms |
+| FastHttpUser, 500 users | 14,020 | 0 | 313.35 | 53.85 ms | 26 ms | 77 ms | 720 ms | 2,418 ms |
 
-- `HttpUser`
-- `FastHttpUser`
-- Normal load
-- Stress load
-- Request rate, failures, and response times
+At 50 users, `HttpUser` and `FastHttpUser` had almost identical throughput because the 1–2 second wait time, rather than client-side HTTP overhead, limited request generation. `FastHttpUser` had a slightly lower average and median and a substantially lower maximum response time in this run. It uses `geventhttpclient`, which has lower client-side overhead than the Python `requests`-based `HttpUser`, although Internet and ECS latency also vary between samples.
+
+The service remained healthy at 200 users. At 500 users, it still returned no failures and throughput reached approximately 313 requests/s, but p98 rose to 720 ms and the maximum reached about 2.4 seconds. This widening tail latency marks the point at which the single 0.25-vCPU, 512-MiB Fargate task began to struggle. The API returned `200 OK` immediately after the test.
+
+`sync.RWMutex` is appropriate for this read-heavy workload because concurrent GET operations can hold read locks together. Each POST needs the exclusive write lock and briefly blocks readers and other writers. At high concurrency, the 25% write share and the fact that every request targets the same product can contribute to lock contention.
+
+Detailed HTML and CSV reports, test code, parameters, and analysis are stored under [`load_test/`](load_test/).
+
+### HttpUser — 50 Users
+
+![HttpUser 50-user Locust report](load_test/screenshots/httpuser_50.png)
+
+### FastHttpUser — 50 Users
+
+![FastHttpUser 50-user Locust report](load_test/screenshots/fasthttpuser_50.png)
+
+### FastHttpUser Stress Test — 500 Users
+
+![FastHttpUser 500-user stress report](load_test/screenshots/stress_fast_500.png)
 
 ## Observability — Part V
 
