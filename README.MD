@@ -8,11 +8,26 @@ This project implements only the Product endpoints from the provided `api.yaml` 
 
 ```text
 CS6650_2b_demo/
+├── docker-compose.yml
 ├── src/
 │   ├── Dockerfile
 │   ├── product-service.go
 │   ├── go.mod
 │   └── go.sum
+├── load_test/
+│   ├── locustfile_httpuser.py
+│   ├── locustfile_fast.py
+│   ├── requirements.txt
+│   ├── results/
+│   └── screenshots/
+├── observability/
+│   ├── prometheus.yml
+│   ├── request-log-excerpt.txt
+│   ├── grafana/
+│   │   └── product-api-red-dashboard.json
+│   └── screenshots/
+├── screenshots/
+│   └── api/
 ├── terraform/
 │   ├── main.tf
 │   ├── provider.tf
@@ -32,6 +47,9 @@ CS6650_2b_demo/
 - Go
 - Gin
 - Docker
+- Locust
+- Prometheus
+- Grafana
 - Terraform
 - AWS ECR
 - AWS ECS Fargate
@@ -609,6 +627,26 @@ Expected:
 Destroy complete!
 ```
 
+## API Verification Screenshots
+
+The following screenshots show the required response codes locally and successful requests against the API deployed on AWS ECS.
+
+### Local 200, 204, and 404 Responses
+
+![Local API success and not-found responses](screenshots/api/local-success-and-not-found.png)
+
+### Local 400 and 404 Responses
+
+![Local API validation and not-found responses](screenshots/api/local-validation-and-not-found.png)
+
+### Local 500 Response
+
+![Local API internal-server-error response](screenshots/api/local-internal-server-error.png)
+
+### AWS-Deployed API
+
+![Successful GET and POST requests against the AWS-deployed API](screenshots/api/aws-deployed-api.png)
+
 ## Implementation Notes
 
 - The API listens on port `8080`.
@@ -656,10 +694,141 @@ Detailed HTML and CSV reports, test code, parameters, and analysis are stored un
 
 ## Observability — Part V
 
-Prometheus, Grafana, structured JSON logs, dashboard screenshots, and the RED-signal analysis will be added after completing Part V.
+The API exposes Prometheus metrics and emits one structured JSON log line for every API request. Prometheus and Grafana run locally with the Product API through Docker Compose; they are not deployed to AWS.
 
-The RED signals are:
+### RED Signals
 
-- Rate
-- Errors
-- Duration
+The Gin middleware records each signal by HTTP method and route template:
+
+| Signal | Prometheus metric | Meaning |
+| --- | --- | --- |
+| Rate | `product_api_requests_total` | Total requests, converted to requests/second with `rate()` |
+| Errors | `product_api_errors_total` | Total non-2xx responses, displayed as a percentage of requests |
+| Duration | `product_api_request_duration_seconds` | Request latency histogram used to calculate p50 and p95 |
+
+Prometheus scrapes the metrics from:
+
+```text
+http://localhost:8080/metrics
+```
+
+![Prometheus custom Product API metrics](observability/screenshots/prometheus-custom-metrics.png)
+
+The `/metrics` scrape itself is excluded from the Product API measurements so monitoring traffic does not change the application results.
+
+### Run the Local Observability Stack
+
+From the repository root:
+
+```bash
+docker compose up -d --build
+```
+
+Check the services:
+
+```bash
+docker compose ps
+```
+
+The local services are:
+
+| Service | URL |
+| --- | --- |
+| Product API | `http://localhost:8080` |
+| Prometheus | `http://localhost:9090` |
+| Grafana | `http://localhost:3000` |
+
+Grafana uses `admin` for both the initial username and password. Add Prometheus as a Grafana data source using this URL:
+
+```text
+http://prometheus:9090
+```
+
+The reusable dashboard is stored at:
+
+```text
+observability/grafana/product-api-red-dashboard.json
+```
+
+To recreate it on another machine, open **Dashboards**, select **New → Import**, upload that JSON file, and select the Prometheus data source when prompted.
+
+Stop the local stack without deleting the saved Grafana volume:
+
+```bash
+docker compose down
+```
+
+### Dashboard Queries
+
+Rate in requests per second:
+
+```promql
+sum by (method, endpoint) (
+  rate(product_api_requests_total[1m])
+)
+```
+
+Percentage of non-2xx responses:
+
+```promql
+100 *
+sum by (method, endpoint) (
+  rate(product_api_errors_total[1m])
+)
+/
+clamp_min(
+  sum by (method, endpoint) (
+    rate(product_api_requests_total[1m])
+  ),
+  0.000001
+)
+```
+
+The Duration panel uses `histogram_quantile()` over `product_api_request_duration_seconds_bucket` to display p50 and p95 latency.
+
+### Local Locust Run
+
+The observability run used `FastHttpUser`, 50 concurrent users, a spawn rate of 10 users/second, a 3:1 GET-to-POST task ratio, and a 1–2 second wait between tasks. The UI run was stopped manually after collecting a full idle-to-loaded-to-idle dashboard window.
+
+| Requests | Failures | Requests/s | Average | Median | p95 | p99 | Maximum |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 3,008 | 0 | 32.73 | 3 ms | 2 ms | 3 ms | 20 ms | 283 ms |
+
+GET processed 2,285 requests and POST processed 723, which is approximately the intended 3:1 read-to-write mix. The API sustained about 33 requests/second with no failures. Locust measured a 2 ms median and 3 ms p95. Grafana displayed approximately 2.5 ms p50 and 5 ms p95 because Prometheus estimates quantiles from histogram bucket boundaries.
+
+![Local Locust observability run](observability/screenshots/locust_ss.png)
+
+### Grafana: Idle Compared with Load
+
+The dashboard shows the request rate rising during the Locust run and returning to zero afterward. GET reached about 25 requests/second, POST reached about 8 requests/second, and the error rate remained at 0%. The duration panel remained stable while the service was loaded.
+
+![Grafana RED dashboard showing idle and loaded behavior](observability/screenshots/grafana-idle-vs-loaded.png)
+
+### Structured Request Logs
+
+Each API request produces one JSON log containing its timestamp, method, route template, status code, and duration in milliseconds. This excerpt is from the same Locust run shown above:
+
+```json
+{"duration_ms":0.088792,"endpoint":"/v1/products/:productId/details","method":"POST","status":204,"timestamp":"2026-10-18T22:48:56Z"}
+{"duration_ms":0.022708,"endpoint":"/v1/products/:productId","method":"GET","status":200,"timestamp":"2026-10-18T22:48:56Z"}
+{"duration_ms":0.11820800000000001,"endpoint":"/v1/products/:productId/details","method":"POST","status":204,"timestamp":"2026-10-18T22:48:57Z"}
+{"duration_ms":0.032666999999999995,"endpoint":"/v1/products/:productId","method":"GET","status":200,"timestamp":"2026-10-18T22:48:57Z"}
+```
+
+The complete short excerpt is stored in [`observability/request-log-excerpt.txt`](observability/request-log-excerpt.txt).
+
+![Structured JSON request logs](observability/screenshots/structured-json-request-logs.png)
+
+I would use the Grafana dashboard for real-time system health, trends, and quickly identifying when rate, errors, or latency changed. I would use the structured logs for after-the-fact debugging and for examining the exact endpoint, status, and duration of individual requests.
+
+### Scalable Backend Design for the Full API
+
+For the complete online-store API, I would keep the HTTP services stateless behind a load balancer and run multiple ECS tasks with automatic scaling. The API would be divided into clear domains such as products/catalog, users, carts, orders, inventory, and payments, allowing the busiest areas to scale independently.
+
+Transactional data such as orders and payments would use a managed relational database such as Amazon Aurora or RDS. Frequently read product data could be cached in ElastiCache, product images could be stored in S3 and served through a CDN, and product search could use OpenSearch. SQS or EventBridge would handle asynchronous work such as order events, inventory updates, and notifications. Authentication, idempotency for write requests, database backups, secrets management, metrics, tracing, and centralized logs would also be included. This removes the single-process in-memory map and allows data and requests to survive container restarts and scale across many instances.
+
+### Why Terraform Is Declarative
+
+Terraform is declarative because the configuration describes the desired final infrastructure, such as an ECS service with a particular task count and network, rather than listing every command required to create it. Terraform compares that desired configuration with its state and the real infrastructure, builds a dependency graph, and produces a plan containing only the required changes.
+
+An imperative approach would specify ordered steps such as create a VPC, then create subnets, then create a cluster, and then start a service. The declarative approach makes infrastructure repeatable, reviewable in version control, easier to reproduce on another machine, and safer to update because `terraform plan` shows the difference before anything is changed.

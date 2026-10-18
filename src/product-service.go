@@ -6,8 +6,85 @@ import (
 	"strconv"
 	"sync"
 
+	"encoding/json"
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"log"
+	"time"
 )
+
+var (
+	requestCount = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "product_api_requests_total",
+			Help: "Total number of Product API requests.",
+		},
+		[]string{"method", "endpoint"},
+	)
+
+	errorCount = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "product_api_errors_total",
+			Help: "Total number of non-2xx responses.",
+		},
+		[]string{"method", "endpoint"},
+	)
+
+	requestDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "product_api_request_duration_seconds",
+			Help:    "Duration of Product API requests.",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"method", "endpoint"},
+	)
+)
+
+func init() {
+	prometheus.MustRegister(requestCount, errorCount, requestDuration)
+}
+
+func recordMetrics() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		start := time.Now()
+
+		c.Next()
+
+		// Prometheus scraping /metrics should not affect API measurements.
+		if c.FullPath() == "/metrics" {
+			return
+		}
+
+		endpoint := c.FullPath()
+		if endpoint == "" {
+			endpoint = c.Request.URL.Path
+		}
+
+		method := c.Request.Method
+		status := c.Writer.Status()
+		duration := time.Since(start).Seconds()
+
+		requestCount.WithLabelValues(method, endpoint).Inc()
+
+		errors := errorCount.WithLabelValues(method, endpoint)
+		errors.Add(0) // Makes zero errors visible in Prometheus.
+		if status < 200 || status >= 300 {
+			errors.Inc()
+		}
+
+		requestDuration.WithLabelValues(method, endpoint).Observe(duration)
+		entry, _ := json.Marshal(map[string]any{
+			"timestamp":   time.Now().UTC().Format(time.RFC3339),
+			"method":      method,
+			"endpoint":    endpoint,
+			"status":      status,
+			"duration_ms": duration * 1000,
+		})
+
+		log.Print(string(entry))
+	}
+}
 
 type Product struct {
 	ProductID    int32  `json:"product_id" binding:"required,min=1"`
@@ -98,6 +175,7 @@ func (s *ProductStore) addProductDetails(c *gin.Context) {
 }
 
 func main() {
+	log.SetFlags(0)
 	zeroWeight := int32(0)
 	store := &ProductStore{
 		products: map[int32]Product{
@@ -113,10 +191,13 @@ func main() {
 	}
 
 	router := gin.New()
+	router.Use(recordMetrics())
 	router.Use(gin.CustomRecovery(func(c *gin.Context, recovered any) {
 		respondError(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Internal server error", "")
 		c.Abort()
 	}))
+
+	router.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	// Temporary middleware used only to test the 500 response.
 	// router.Use(func(c *gin.Context) {
